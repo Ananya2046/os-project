@@ -118,7 +118,9 @@ Job *job_create(pid_t pgid, const char *cmdline, int is_foreground) {
         update_current_job(job->job_id);
     }
 
-    gui_event_emit("JOB_ADD|%d|%d|%s|%s", job->job_id, (int)job->pgid, job->command_line, "RUNNING");
+    if (job->pgid > 0) {
+        gui_event_emit("JOB_ADD|%d|%d|%s|%s", job->job_id, (int)job->pgid, job->command_line, "RUNNING");
+    }
 
     signals_unblock_chld(&old_mask);
     return job;

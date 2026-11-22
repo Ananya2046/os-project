@@ -3,33 +3,68 @@
 gui_app.py - Native Desktop GUI for Mini Linux Shell (mysh)
 Course: OS Lab (24B11CS312), JIIT Noida
 
+Cross-platform: works on Linux, macOS, and Windows (via WSL).
+
 Hard Rules Satisfied:
 1. Native Desktop Application opening in its own window (Tkinter Desktop GUI).
 2. NO web, NO browser, NO HTML/JS, NO localhost, NO sockets, NO ports.
-3. IPC Communication uses local OS mechanisms: pseudo-terminal (pty) and named pipe (FIFO).
+3. IPC Communication uses local OS mechanisms: pseudo-terminal (pty) / subprocess pipes.
 4. Connects directly to the real compiled C binary: ./mysh
 5. Team Members: Tanishq Pundir, Anvi, Annanya Aggarwal, Palak Chauhan
 """
 
 import os
 import sys
-import pty
 import time
-import fcntl
-import struct
-import termios
-import signal
-import errno
 import re
 import queue
 import threading
 import subprocess
+import signal
+import errno
+import struct
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+# ------------------------------------------------------------------ #
+#  Platform detection                                                   #
+# ------------------------------------------------------------------ #
+IS_WINDOWS = sys.platform == "win32"
+
+# Conditional POSIX-only imports
+if not IS_WINDOWS:
+    import pty
+    import fcntl
+    import termios
+
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SHELL_BIN = os.path.join(PROJECT_DIR, "mysh")
-FIFO_PATH = "/tmp/mysh_gui_fifo_{}".format(os.getpid())
+
+if IS_WINDOWS:
+    FIFO_PATH = ""  # Windows: no FIFO; events via temp file or disabled
+else:
+    FIFO_PATH = "/tmp/mysh_gui_fifo_{}".format(os.getpid())
+
+
+def _find_wsl_shell_binary():
+    """On Windows, locate the mysh binary via WSL.
+    Returns the WSL command prefix + path, or None if WSL not available."""
+    try:
+        # Check if wsl is available
+        result = subprocess.run(
+            ["wsl", "--status"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        )
+        # Convert Windows path to WSL path
+        wsl_project_dir = subprocess.check_output(
+            ["wsl", "wslpath", "-a", PROJECT_DIR],
+            text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        ).strip()
+        return wsl_project_dir
+    except Exception:
+        return None
 
 
 class ShellGuiApp:
@@ -46,16 +81,19 @@ class ShellGuiApp:
         self.master_fd = -1
         self.shell_pid = -1
         self.shell_alive = False
+        self.shell_proc = None  # subprocess.Popen on Windows
 
         # Thread-safe communication queues from worker threads to main GUI thread
         self.pty_queue = queue.Queue()
         self.fifo_queue = queue.Queue()
 
-        # Setup FIFO for shell event IPC
-        if os.path.exists(FIFO_PATH):
-            os.remove(FIFO_PATH)
-        os.mkfifo(FIFO_PATH, 0o600)
-        self.fifo_fd = os.open(FIFO_PATH, os.O_RDWR | os.O_NONBLOCK)
+        # FIFO setup (Unix only)
+        self.fifo_fd = -1
+        if not IS_WINDOWS:
+            if os.path.exists(FIFO_PATH):
+                os.remove(FIFO_PATH)
+            os.mkfifo(FIFO_PATH, 0o600)
+            self.fifo_fd = os.open(FIFO_PATH, os.O_RDWR | os.O_NONBLOCK)
 
         # Style configuration
         self.style = ttk.Style()
@@ -68,7 +106,7 @@ class ShellGuiApp:
                        background=[("selected", "#0284c7")],
                        foreground=[("selected", "#ffffff")])
 
-        # Toolbar button styles (macOS-friendly ttk buttons)
+        # Toolbar button styles (macOS/Windows-friendly ttk buttons)
         self.style.configure("Green.TButton", background="#10b981", foreground="#ffffff",
                              font=("Helvetica", 10, "bold"), padding=4)
         self.style.map("Green.TButton",
@@ -96,7 +134,8 @@ class ShellGuiApp:
 
         self.create_widgets()
         self.start_shell_process()
-        self.start_fifo_reader()
+        if not IS_WINDOWS:
+            self.start_fifo_reader()
         self.root.after(10, self._poll_queues)
 
     # ------------------------------------------------------------------ #
@@ -130,12 +169,15 @@ class ShellGuiApp:
         left_frame = tk.Frame(paned, bg="#000000")
         paned.add(left_frame, minsize=520)
 
+        # Choose a monospace font available on the platform
+        mono_font = "Consolas" if IS_WINDOWS else "Menlo"
+
         tk.Label(left_frame, text="mysh Embedded Terminal (/dev/pty)", bg="#090d16",
                  fg="#94a3b8", font=("Courier", 10, "bold"), anchor="w",
                  padx=8, pady=4).pack(fill=tk.X)
 
         self.term_text = tk.Text(left_frame, bg="#05070d", fg="#38bdf8",
-                                 insertbackground="#38bdf8", font=("Menlo", 11),
+                                 insertbackground="#38bdf8", font=(mono_font, 11),
                                  wrap="char", relief="flat", padx=8, pady=8)
         self.term_text.pack(fill=tk.BOTH, expand=True)
         self.term_text.bind("<Key>", self.on_term_key)
@@ -204,7 +246,7 @@ class ShellGuiApp:
                  fg="#f8fafc", font=("Helvetica", 10, "bold"), anchor="w"
                  ).pack(fill=tk.X, pady=(6, 2))
         self.sig_text = tk.Text(right_frame, bg="#090d16", fg="#94a3b8", height=6,
-                                font=("Menlo", 9), relief="flat", padx=6, pady=4)
+                                font=(mono_font, 9), relief="flat", padx=6, pady=4)
         self.sig_text.pack(fill=tk.BOTH, expand=True)
 
         # 3. Status Bar
@@ -214,9 +256,16 @@ class ShellGuiApp:
         self.update_status()
 
     # ------------------------------------------------------------------ #
-    #  Shell process management (pty.fork)                                 #
+    #  Shell process management                                            #
     # ------------------------------------------------------------------ #
     def start_shell_process(self):
+        """Start ./mysh - uses pty.fork() on Unix, subprocess on Windows."""
+        if IS_WINDOWS:
+            self._start_shell_windows()
+        else:
+            self._start_shell_unix()
+
+    def _start_shell_unix(self):
         """Start ./mysh inside a real pseudo-terminal using pty.fork()."""
         pid, fd = pty.fork()
         if pid == 0:
@@ -258,11 +307,67 @@ class ShellGuiApp:
                 pass
 
             # Start reader thread
-            t = threading.Thread(target=self.pty_reader_thread, daemon=True)
+            t = threading.Thread(target=self._pty_reader_thread_unix, daemon=True)
             t.start()
 
             # Start periodic process poll
             self.root.after(1000, self.poll_processes)
+
+    def _start_shell_windows(self):
+        """Start mysh via WSL on Windows using subprocess with pipes."""
+        wsl_dir = _find_wsl_shell_binary()
+        if wsl_dir is None:
+            self.append_term_text(
+                "ERROR: WSL (Windows Subsystem for Linux) is not installed.\n"
+                "This shell requires WSL to run on Windows.\n\n"
+                "Install WSL with:  wsl --install\n"
+                "Then restart this application.\n"
+                "See README.md for detailed instructions.\n"
+            )
+            self.shell_alive = False
+            return
+
+        # Build mysh if not already built, then run it
+        try:
+            # Ensure it's compiled
+            subprocess.run(
+                ["wsl", "bash", "-c",
+                 "cd '{}' && make -q mysh 2>/dev/null || make".format(wsl_dir)],
+                capture_output=True, timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
+
+        # Launch mysh via WSL
+        try:
+            self.shell_proc = subprocess.Popen(
+                ["wsl", "bash", "-c",
+                 "cd '{}' && ./mysh".format(wsl_dir)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            self.shell_pid = self.shell_proc.pid
+            self.shell_alive = True
+
+            # Start reader thread for subprocess stdout
+            t = threading.Thread(target=self._pty_reader_thread_windows, daemon=True)
+            t.start()
+
+            # Start periodic process poll
+            self.root.after(1000, self.poll_processes)
+
+        except FileNotFoundError:
+            self.append_term_text(
+                "ERROR: Could not launch WSL.\n"
+                "Make sure WSL is installed: wsl --install\n"
+            )
+            self.shell_alive = False
+        except Exception as e:
+            self.append_term_text("ERROR: Failed to start shell: {}\n".format(e))
+            self.shell_alive = False
 
     def _poll_queues(self):
         """Processes messages from background threads exclusively on the main Tk thread."""
@@ -285,7 +390,7 @@ class ShellGuiApp:
 
         self.root.after(10, self._poll_queues)
 
-    def pty_reader_thread(self):
+    def _pty_reader_thread_unix(self):
         """Read output from the shell's pty and dispatch via thread-safe queue."""
         while self.shell_alive:
             try:
@@ -302,8 +407,34 @@ class ShellGuiApp:
                 elif e.errno == errno.EAGAIN:
                     time.sleep(0.01)
                 else:
-                    self.pty_queue.put(("DIED", f"Shell error: {e}"))
+                    self.pty_queue.put(("DIED", "Shell error: {}".format(e)))
                     break
+
+    def _pty_reader_thread_windows(self):
+        """Read output from subprocess stdout pipe (Windows/WSL mode)."""
+        while self.shell_alive and self.shell_proc:
+            try:
+                data = self.shell_proc.stdout.read(1)
+                if not data:
+                    self.pty_queue.put(("DIED", "Shell closed (EOF)"))
+                    break
+                # Buffer: read all available bytes
+                buf = data
+                try:
+                    while True:
+                        # Try to read more without blocking (use a small chunk)
+                        more = self.shell_proc.stdout.read1(4096) if hasattr(self.shell_proc.stdout, 'read1') else b""
+                        if more:
+                            buf += more
+                        else:
+                            break
+                except Exception:
+                    pass
+                text = buf.decode(errors="replace")
+                self.pty_queue.put(("TEXT", text))
+            except Exception:
+                self.pty_queue.put(("DIED", "Shell error (read failed)"))
+                break
 
     def _on_shell_died(self, reason):
         """Handle shell death from the main thread."""
@@ -312,31 +443,53 @@ class ShellGuiApp:
         self.shell_alive = False
         # Reap child
         exit_msg = reason
-        try:
-            _, status = os.waitpid(self.shell_pid, os.WNOHANG)
-            if os.WIFEXITED(status):
-                exit_msg = "mysh exited with code {}".format(os.WEXITSTATUS(status))
-            elif os.WIFSIGNALED(status):
-                exit_msg = "mysh killed by signal {}".format(os.WTERMSIG(status))
-        except Exception:
-            pass
+        if IS_WINDOWS:
+            if self.shell_proc:
+                try:
+                    self.shell_proc.wait(timeout=2)
+                    exit_msg = "mysh exited with code {}".format(self.shell_proc.returncode)
+                except Exception:
+                    pass
+        else:
+            try:
+                _, status = os.waitpid(self.shell_pid, os.WNOHANG)
+                if os.WIFEXITED(status):
+                    exit_msg = "mysh exited with code {}".format(os.WEXITSTATUS(status))
+                elif os.WIFSIGNALED(status):
+                    exit_msg = "mysh killed by signal {}".format(os.WTERMSIG(status))
+            except Exception:
+                pass
         self.append_term_text("\n\n--- {} ---\n".format(exit_msg))
         self.log_event(exit_msg)
-        try:
-            os.close(self.master_fd)
-        except Exception:
-            pass
+        if not IS_WINDOWS:
+            try:
+                os.close(self.master_fd)
+            except Exception:
+                pass
         self.master_fd = -1
 
     def _safe_write_pty(self, data):
-        """Write bytes to the pty master, returning True on success."""
-        if not self.shell_alive or self.master_fd < 0:
+        """Write bytes to the pty master (or subprocess stdin), returning True on success."""
+        if not self.shell_alive:
             self.log_event("Shell not running. Click 'New Session' to restart.")
             return False
         try:
-            os.write(self.master_fd, data)
-            return True
+            if IS_WINDOWS:
+                if self.shell_proc and self.shell_proc.stdin:
+                    self.shell_proc.stdin.write(data)
+                    self.shell_proc.stdin.flush()
+                    return True
+                return False
+            else:
+                if self.master_fd < 0:
+                    self.log_event("Shell not running. Click 'New Session' to restart.")
+                    return False
+                os.write(self.master_fd, data)
+                return True
         except OSError:
+            self._on_shell_died("Write failed (shell died)")
+            return False
+        except Exception:
             self._on_shell_died("Write failed (shell died)")
             return False
 
@@ -395,7 +548,7 @@ class ShellGuiApp:
 
     def on_term_key(self, event):
         """Forward keystrokes from the Tk Text widget to the pty as raw bytes."""
-        ctrl = bool(event.state & 0x4)   # Control key mask on macOS Tk
+        ctrl = bool(event.state & 0x4)   # Control key mask
 
         # Control-key combos first
         if ctrl:
@@ -448,21 +601,33 @@ class ShellGuiApp:
         """Kill the old shell and start a fresh one."""
         # Kill old shell
         if self.shell_alive:
-            try:
-                os.killpg(os.getpgid(self.shell_pid), signal.SIGHUP)
-            except Exception:
-                pass
-            try:
-                os.waitpid(self.shell_pid, 0)
-            except Exception:
-                pass
+            if IS_WINDOWS:
+                if self.shell_proc:
+                    try:
+                        self.shell_proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        self.shell_proc.wait(timeout=3)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    os.killpg(os.getpgid(self.shell_pid), signal.SIGHUP)
+                except Exception:
+                    pass
+                try:
+                    os.waitpid(self.shell_pid, 0)
+                except Exception:
+                    pass
         self.shell_alive = False
-        try:
-            if self.master_fd >= 0:
-                os.close(self.master_fd)
-        except Exception:
-            pass
-        self.master_fd = -1
+        if not IS_WINDOWS:
+            try:
+                if self.master_fd >= 0:
+                    os.close(self.master_fd)
+            except Exception:
+                pass
+            self.master_fd = -1
         self.jobs.clear()
         self.refresh_jobs_tree()
         self.clear_terminal()
@@ -470,7 +635,7 @@ class ShellGuiApp:
         self.log_event("Started new shell session")
 
     # ------------------------------------------------------------------ #
-    #  FIFO reader (shell -> GUI events)                                   #
+    #  FIFO reader (shell -> GUI events) — Unix only                       #
     # ------------------------------------------------------------------ #
     def start_fifo_reader(self):
         t = threading.Thread(target=self.fifo_reader_thread, daemon=True)
@@ -523,10 +688,10 @@ class ShellGuiApp:
                 self.log_event("JOB_DONE: [{}] finished (code {})".format(jid, code))
 
         elif etype == "PIPE_CREATE" and len(parts) >= 2:
-            n = int(parts[1])
-            self.stages = ["Stage {}".format(i + 1) for i in range(n)]
+            n_stages = int(parts[1])
+            self.stages = ["Stage {}".format(i + 1) for i in range(n_stages)]
             self.draw_pipeline_stages()
-            self.log_event("PIPE_CREATE: Created {}-stage IPC pipeline".format(n))
+            self.log_event("PIPE_CREATE: Created {}-stage IPC pipeline".format(n_stages))
 
         elif etype == "PROC_NEW" and len(parts) >= 4:
             pid_s = parts[1]
@@ -570,7 +735,7 @@ class ShellGuiApp:
             self.pipe_canvas.create_rectangle(x, y, x + w, y + h,
                                               fill="#1e293b", outline="#10b981", width=2)
             self.pipe_canvas.create_text(x + w / 2, y + h / 2, text=stage,
-                                         fill="#f8fafc", font=("Menlo", 9, "bold"))
+                                         fill="#f8fafc", font=("Courier", 9, "bold"))
             if i < len(self.stages) - 1:
                 ax1 = x + w + 4
                 ax2 = ax1 + spacing - 8
@@ -581,14 +746,23 @@ class ShellGuiApp:
                                              text="pipe", fill="#eab308", font=("Helvetica", 7))
 
     def poll_processes(self):
-        """Query child processes using ps (works on macOS, no /proc needed)."""
+        """Query child processes using ps (works on macOS/Linux, no /proc needed)."""
         for item in self.proc_tree.get_children():
             self.proc_tree.delete(item)
         if self.shell_alive and self.shell_pid > 0:
             try:
-                res = subprocess.check_output(
-                    ["ps", "-o", "pid,ppid,pgid,state,command", "-g", str(self.shell_pid)],
-                    text=True, stderr=subprocess.DEVNULL)
+                if IS_WINDOWS:
+                    # On Windows, query via WSL ps
+                    res = subprocess.check_output(
+                        ["wsl", "ps", "-o", "pid,ppid,pgid,state,command",
+                         "--ppid", str(self.shell_pid)],
+                        text=True, stderr=subprocess.DEVNULL, timeout=3,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                else:
+                    res = subprocess.check_output(
+                        ["ps", "-o", "pid,ppid,pgid,state,command", "-g", str(self.shell_pid)],
+                        text=True, stderr=subprocess.DEVNULL)
                 for line in res.strip().split("\n")[1:]:
                     parts = line.split(None, 4)
                     if len(parts) >= 5:
@@ -606,9 +780,10 @@ class ShellGuiApp:
     def update_status(self):
         running = sum(1 for j in self.jobs.values() if j["state"] == "RUNNING")
         stopped = sum(1 for j in self.jobs.values() if j["state"] == "STOPPED")
+        platform_label = "Windows/WSL" if IS_WINDOWS else ("macOS" if sys.platform == "darwin" else "Linux")
         self.status_bar.config(
-            text=" Directory: {}   |   Running Jobs: {}   |   Stopped Jobs: {}   |   Last Exit: {}".format(
-                self.cwd, running, stopped, self.last_exit))
+            text=" Platform: {}  |  Directory: {}  |  Running Jobs: {}  |  Stopped Jobs: {}  |  Last Exit: {}".format(
+                platform_label, self.cwd, running, stopped, self.last_exit))
 
     # ------------------------------------------------------------------ #
     #  Job control buttons                                                 #
@@ -625,11 +800,15 @@ class ShellGuiApp:
         res = self.get_selected_job()
         if res:
             jid, pgid = res
-            try:
-                os.kill(-pgid, signal.SIGTSTP)
-                self.log_event("Sent SIGTSTP to Process Group -{}".format(pgid))
-            except OSError as e:
-                self.log_event("SIGTSTP failed: {}".format(e))
+            if IS_WINDOWS:
+                self.send_to_pty("\x1a")  # Send Ctrl+Z
+                self.log_event("Sent Ctrl+Z (SIGTSTP) via WSL")
+            else:
+                try:
+                    os.kill(-pgid, signal.SIGTSTP)
+                    self.log_event("Sent SIGTSTP to Process Group -{}".format(pgid))
+                except OSError as e:
+                    self.log_event("SIGTSTP failed: {}".format(e))
 
     def job_bg(self):
         res = self.get_selected_job()
@@ -649,11 +828,15 @@ class ShellGuiApp:
         res = self.get_selected_job()
         if res:
             jid, pgid = res
-            try:
-                os.kill(-pgid, signal.SIGKILL)
-                self.log_event("Sent SIGKILL to Process Group -{}".format(pgid))
-            except OSError as e:
-                self.log_event("SIGKILL failed: {}".format(e))
+            if IS_WINDOWS:
+                self.send_to_pty("kill %{}\n".format(jid))
+                self.log_event("Sent kill command for Job [{}]".format(jid))
+            else:
+                try:
+                    os.kill(-pgid, signal.SIGKILL)
+                    self.log_event("Sent SIGKILL to Process Group -{}".format(pgid))
+                except OSError as e:
+                    self.log_event("SIGKILL failed: {}".format(e))
 
     # ------------------------------------------------------------------ #
     #  Demo mode                                                           #
@@ -677,6 +860,7 @@ class ShellGuiApp:
     #  About dialog                                                        #
     # ------------------------------------------------------------------ #
     def show_about_dialog(self):
+        platform_info = "Windows (WSL)" if IS_WINDOWS else ("macOS" if sys.platform == "darwin" else "Linux")
         msg = ("Mini Linux Shell (mysh) - Native Desktop GUI\n\n"
                "Operating Systems Lab (24B11CS312)\n"
                "Jaypee Institute of Information Technology (JIIT), Noida\n\n"
@@ -685,10 +869,11 @@ class ShellGuiApp:
                "  Anvi\n"
                "  Annanya Aggarwal\n"
                "  Palak Chauhan\n\n"
+               "Platform: {}\n\n"
                "Architecture:\n"
                "Native Desktop Window <-> pseudo-terminal (pty) <-> ./mysh (C binary)\n"
                "Status updates via non-blocking named pipe (FIFO) in /tmp.\n"
-               "Zero web sockets, zero localhost, zero network dependencies.")
+               "Zero web sockets, zero localhost, zero network dependencies.".format(platform_info))
         messagebox.showinfo("About - Mini Linux Shell", msg)
 
     # ------------------------------------------------------------------ #
@@ -697,26 +882,34 @@ class ShellGuiApp:
     def on_close(self):
         """Clean termination of shell and FIFO."""
         if self.shell_alive:
-            try:
-                os.killpg(os.getpgid(self.shell_pid), signal.SIGHUP)
-                os.killpg(os.getpgid(self.shell_pid), signal.SIGCONT)
-            except Exception:
-                pass
+            if IS_WINDOWS:
+                if self.shell_proc:
+                    try:
+                        self.shell_proc.terminate()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    os.killpg(os.getpgid(self.shell_pid), signal.SIGHUP)
+                    os.killpg(os.getpgid(self.shell_pid), signal.SIGCONT)
+                except Exception:
+                    pass
         self.shell_alive = False
-        try:
-            if self.master_fd >= 0:
-                os.close(self.master_fd)
-        except Exception:
-            pass
-        try:
-            os.close(self.fifo_fd)
-        except Exception:
-            pass
-        if os.path.exists(FIFO_PATH):
+        if not IS_WINDOWS:
             try:
-                os.remove(FIFO_PATH)
+                if self.master_fd >= 0:
+                    os.close(self.master_fd)
             except Exception:
                 pass
+            try:
+                os.close(self.fifo_fd)
+            except Exception:
+                pass
+            if os.path.exists(FIFO_PATH):
+                try:
+                    os.remove(FIFO_PATH)
+                except Exception:
+                    pass
         self.root.destroy()
 
 

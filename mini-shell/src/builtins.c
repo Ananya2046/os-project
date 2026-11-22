@@ -17,6 +17,7 @@
 #include "gui_events.h"
 #include <limits.h>
 #include <signal.h>
+#include <strings.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -78,10 +79,13 @@ int is_builtin(const char *cmd_name) {
     if (!cmd_name) return 0;
     return (strcmp(cmd_name, "cd") == 0 ||
             strcmp(cmd_name, "pwd") == 0 ||
+            strcmp(cmd_name, "echo") == 0 ||
             strcmp(cmd_name, "exit") == 0 ||
             strcmp(cmd_name, "jobs") == 0 ||
             strcmp(cmd_name, "fg") == 0 ||
             strcmp(cmd_name, "bg") == 0 ||
+            strcmp(cmd_name, "kill") == 0 ||
+            strcmp(cmd_name, "clear") == 0 ||
             strcmp(cmd_name, "export") == 0 ||
             strcmp(cmd_name, "help") == 0 ||
             strcmp(cmd_name, "history") == 0);
@@ -89,11 +93,18 @@ int is_builtin(const char *cmd_name) {
 
 static int builtin_cd(Command *cmd) {
     const char *target = NULL;
+    char path_buf[PATH_MAX];
     char cwd_before[PATH_MAX];
     char cwd_after[PATH_MAX];
 
     if (getcwd(cwd_before, sizeof(cwd_before)) == NULL) {
-        cwd_before[0] = '\0';
+        const char *pwd_env = getenv("PWD");
+        if (pwd_env) {
+            strncpy(cwd_before, pwd_env, sizeof(cwd_before) - 1);
+            cwd_before[sizeof(cwd_before) - 1] = '\0';
+        } else {
+            cwd_before[0] = '\0';
+        }
     }
 
     if (cmd->argc < 2) {
@@ -109,6 +120,17 @@ static int builtin_cd(Command *cmd) {
             return 1;
         }
         printf("%s\n", target);
+    } else if (cmd->argv[1][0] == '~') {
+        const char *home = getenv("HOME");
+        if (!home) home = "";
+        if (cmd->argv[1][1] == '\0') {
+            target = home;
+        } else if (cmd->argv[1][1] == '/') {
+            snprintf(path_buf, sizeof(path_buf), "%s%s", home, cmd->argv[1] + 1);
+            target = path_buf;
+        } else {
+            target = cmd->argv[1];
+        }
     } else {
         target = cmd->argv[1];
     }
@@ -124,6 +146,12 @@ static int builtin_cd(Command *cmd) {
         }
         setenv("PWD", cwd_after, 1);
         gui_event_emit("CWD_CHANGE|%s", cwd_after);
+    } else {
+        if (cwd_before[0] != '\0') {
+            setenv("OLDPWD", cwd_before, 1);
+        }
+        setenv("PWD", target, 1);
+        gui_event_emit("CWD_CHANGE|%s", target);
     }
 
     return 0;
@@ -134,10 +162,39 @@ static int builtin_pwd(void) {
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
         printf("%s\n", cwd);
         return 0;
-    } else {
-        shell_perror("pwd");
-        return 1;
     }
+    const char *pwd_env = getenv("PWD");
+    if (pwd_env && *pwd_env != '\0') {
+        printf("%s\n", pwd_env);
+        return 0;
+    }
+    shell_perror("pwd");
+    return 1;
+}
+
+static int builtin_echo(Command *cmd) {
+    int start = 1;
+    int newline = 1;
+
+    if (cmd->argc > 1 && strcmp(cmd->argv[1], "-n") == 0) {
+        newline = 0;
+        start = 2;
+    }
+
+    for (int i = start; i < cmd->argc; i++) {
+        printf("%s%s", cmd->argv[i], (i == cmd->argc - 1) ? "" : " ");
+    }
+    if (newline) {
+        printf("\n");
+    }
+    fflush(stdout);
+    return 0;
+}
+
+static int builtin_clear(void) {
+    printf("\033[H\033[2J");
+    fflush(stdout);
+    return 0;
 }
 
 static int builtin_export(Command *cmd) {
@@ -255,16 +312,85 @@ static int builtin_bg(Command *cmd) {
     return 0;
 }
 
+static int builtin_kill(Command *cmd) {
+    if (cmd->argc < 2) {
+        fprintf(stderr, "mysh: kill: usage: kill [-sig] pid | %%job_id ...\n");
+        return 1;
+    }
+
+    int sig = SIGTERM;
+    int arg_idx = 1;
+
+    /* Parse optional signal flag: -9, -15, -TERM, -KILL, -STOP, -CONT */
+    if (cmd->argv[arg_idx][0] == '-' && cmd->argv[arg_idx][1] != '\0') {
+        const char *s = cmd->argv[arg_idx] + 1;
+        if (strcmp(s, "9") == 0 || strcasecmp(s, "KILL") == 0 || strcasecmp(s, "SIGKILL") == 0) {
+            sig = SIGKILL;
+        } else if (strcmp(s, "15") == 0 || strcasecmp(s, "TERM") == 0 || strcasecmp(s, "SIGTERM") == 0) {
+            sig = SIGTERM;
+        } else if (strcmp(s, "2") == 0 || strcasecmp(s, "INT") == 0 || strcasecmp(s, "SIGINT") == 0) {
+            sig = SIGINT;
+        } else if (strcmp(s, "19") == 0 || strcasecmp(s, "STOP") == 0 || strcasecmp(s, "SIGSTOP") == 0) {
+            sig = SIGSTOP;
+        } else if (strcmp(s, "18") == 0 || strcasecmp(s, "CONT") == 0 || strcasecmp(s, "SIGCONT") == 0) {
+            sig = SIGCONT;
+        } else {
+            sig = atoi(s);
+            if (sig <= 0) sig = SIGTERM;
+        }
+        arg_idx++;
+    }
+
+    int ret = 0;
+    for (int i = arg_idx; i < cmd->argc; i++) {
+        const char *target = cmd->argv[i];
+        if (target[0] == '%') {
+            int jid = atoi(target + 1);
+            Job *j = job_find_by_id(jid);
+            if (!j) {
+                fprintf(stderr, "mysh: kill: %s: no such job\n", target);
+                ret = 1;
+                continue;
+            }
+            if (j->pgid > 0) {
+                if (kill(-j->pgid, sig) < 0) {
+                    shell_perror("kill");
+                    ret = 1;
+                } else {
+                    gui_event_emit("SIG_EVENT|SIGKILL|Sent signal %d to job [%d] (pgid %d)", sig, jid, (int)j->pgid);
+                }
+            }
+        } else {
+            pid_t pid = (pid_t)atoi(target);
+            if (pid == 0) {
+                fprintf(stderr, "mysh: kill: %s: invalid pid\n", target);
+                ret = 1;
+                continue;
+            }
+            if (kill(pid, sig) < 0) {
+                shell_perror("kill");
+                ret = 1;
+            } else {
+                gui_event_emit("SIG_EVENT|SIGKILL|Sent signal %d to pid %d", sig, (int)pid);
+            }
+        }
+    }
+    return ret;
+}
+
 static int builtin_help(void) {
     printf("Mini Linux Shell (mysh) - Built-in Commands & Features\n");
     printf("=====================================================\n");
     printf("Built-in Commands:\n");
-    printf("  cd [dir]       Change current working directory (supports HOME and '-')\n");
+    printf("  cd [dir]       Change current working directory (supports HOME, '~', and '-')\n");
     printf("  pwd            Print current working directory\n");
+    printf("  echo [args]    Print arguments to standard output (-n supported)\n");
+    printf("  clear          Clear terminal display screen\n");
     printf("  export VAR=val Set environment variable in shell environment\n");
     printf("  jobs           List active and stopped jobs with [+] and [-] markers\n");
     printf("  fg [%%job_id]   Bring background or stopped job to the foreground\n");
     printf("  bg [%%job_id]   Resume stopped job in the background (send SIGCONT)\n");
+    printf("  kill [-sig] id Send signal to process or %%job_id (e.g. kill -9 %%1)\n");
     printf("  history        Display command history for this session\n");
     printf("  help           Display this help information\n");
     printf("  exit [code]    Exit the shell (warns if stopped jobs exist)\n\n");
@@ -293,6 +419,10 @@ int execute_builtin(Command *cmd) {
         return builtin_cd(cmd);
     } else if (strcmp(name, "pwd") == 0) {
         return builtin_pwd();
+    } else if (strcmp(name, "echo") == 0) {
+        return builtin_echo(cmd);
+    } else if (strcmp(name, "clear") == 0) {
+        return builtin_clear();
     } else if (strcmp(name, "export") == 0) {
         return builtin_export(cmd);
     } else if (strcmp(name, "exit") == 0) {
@@ -303,6 +433,8 @@ int execute_builtin(Command *cmd) {
         return builtin_fg(cmd);
     } else if (strcmp(name, "bg") == 0) {
         return builtin_bg(cmd);
+    } else if (strcmp(name, "kill") == 0) {
+        return builtin_kill(cmd);
     } else if (strcmp(name, "help") == 0) {
         return builtin_help();
     } else if (strcmp(name, "history") == 0) {

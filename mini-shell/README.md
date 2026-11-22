@@ -189,7 +189,41 @@ make clean
 
 ---
 
-## 5. Technical Limitations
+## 5. Running on Windows (WSL)
+
+`mysh` uses POSIX system calls (`fork`, `execvp`, `pipe`, `setpgid`, `tcsetpgrp`, `sigaction`) that require a Linux/Unix kernel. On Windows, the **Windows Subsystem for Linux (WSL2)** provides a full Linux kernel to run the shell natively.
+
+### Quick Start
+
+1. **Install WSL2** (Administrator PowerShell):
+   ```powershell
+   wsl --install
+   ```
+   Restart your computer when prompted.
+
+2. **Install dependencies** (in WSL/Ubuntu terminal):
+   ```bash
+   sudo apt update && sudo apt install -y build-essential python3 python3-tk
+   ```
+
+3. **Build and Run**:
+   - **Easy way**: Double-click `run_windows.bat` in the project folder.
+   - **Manual way** (in WSL terminal):
+     ```bash
+     cd /mnt/c/Users/YourName/Desktop/"os lab project"/mini-shell
+     make
+     ./mysh          # Terminal mode
+     python3 gui_app.py  # GUI mode
+     ```
+
+> **Windows 11**: GUI works out of the box via WSLg.  
+> **Windows 10**: Requires an X server (e.g., VcXsrv). See [`docs/WINDOWS_SETUP.md`](docs/WINDOWS_SETUP.md) for details.
+
+For the complete Windows setup guide, see: **[docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md)**
+
+---
+
+## 6. Technical Limitations
 1. **Interactive Line Editing**: Advanced readline shortcuts (arrow keys, tab completion) are not included to adhere strictly to libc without external libraries (e.g., `libreadline`). Standard terminal canonical editing (Backspace, Enter, Ctrl+U, Ctrl+D) is supported natively by the tty driver.
 2. **Compound Control Flow**: Shell scripting language constructs (`if/then`, `for/while`, shell functions) are out of scope for this process and job control lab.
 

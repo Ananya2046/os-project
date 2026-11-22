@@ -326,6 +326,7 @@ int execute_pipeline(Pipeline *pipeline) {
          */
         if (i == 0) {
             job->pgid = pid;
+            gui_event_emit("JOB_ADD|%d|%d|%s|%s", job->job_id, (int)job->pgid, job->command_line, pipeline->background ? "RUNNING" : "FOREGROUND");
         }
         setpgid(pid, job->pgid);
 

@@ -15,6 +15,18 @@
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 
+#if defined(__has_include) && !__has_include(<gtk/gtk.h>)
+/* GTK 3 is not installed on this host (macOS / Windows).
+ * On Ubuntu Linux, install with: sudo apt-get install libgtk-3-dev libvte-2.91-dev
+ * Cross-platform native desktop GUI is provided via: python3 gui_app.py */
+#include <stdio.h>
+int main(void) {
+    fprintf(stderr, "mysh-gui: GTK 3 was not found on this system.\n");
+    fprintf(stderr, "Please launch the desktop GUI using: python3 gui_app.py\n");
+    return 1;
+}
+#else
+
 #include <gtk/gtk.h>
 #ifndef NO_VTE
 #include <vte/vte.h>
@@ -800,4 +812,5 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+#endif
 
